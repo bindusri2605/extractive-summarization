@@ -89,6 +89,11 @@ def run_hi_legal_sum(text, k, w_sem, w_pos, w_tfidf, lambda_param):
 st.title("🧾 HiLegalSum")
 st.subheader("Legal-Aware Extractive Summarization")
 
+st.link_button(
+    "🔗 View Source Code",
+    "https://github.com/bindusri2605/extractive-summarization"
+)
+
 # Sidebar
 with st.sidebar:
     st.header("⚙️ Algorithm Settings")
