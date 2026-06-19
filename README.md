@@ -8,7 +8,12 @@ Legal texts are typically long, complex, and filled with domain-specific termino
 
 The proposed framework combines semantic understanding, statistical weighting, positional importance, and graph-based ranking techniques to generate high-quality legal summaries that are coherent, informative, and less redundant.
 
----
+## Live Demo
+
+🔗 **Streamlit App:** https://hilegalsum-legal-text-summarization-r4ecdh07so.streamlit.app/
+
+Users can upload legal documents or paste bill text directly into the application and generate summaries interactively using the HiLegalSum framework.
+
 
 ## Problem Statement
 
