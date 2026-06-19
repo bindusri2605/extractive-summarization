@@ -10,7 +10,7 @@ The proposed framework combines semantic understanding, statistical weighting, p
 
 ## Live Demo
 
-🔗 **Streamlit App:** https://hilegalsum-legal-text-summarization-r4ecdh07so.streamlit.app/
+🔗 **Streamlit App:** [https://hilegalsum-legal-text-summarization-r4ecdh07so.streamlit.app/](https://extractive-summarization-9duvqc3vhtqzjkubyhqk4t.streamlit.app/)
 
 Users can upload legal documents or paste bill text directly into the application and generate summaries interactively using the HiLegalSum framework.
 
