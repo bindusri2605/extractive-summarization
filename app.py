@@ -85,7 +85,157 @@ def run_hi_legal_sum(text, k, w_sem, w_pos, w_tfidf, lambda_param):
 
 
 # ============================================
-# 2b. REQUIREMENT ANALYSIS LOGIC (NEW)
+# 2b. LEGAL SUGGESTIONS LOGIC (NEW)
+# ============================================
+# No external LLM/API is available in this project, so the suggestions below
+# are derived directly, and only, from the user's ORIGINAL legal context
+# using regex/keyword rules and the sentence list already produced by the
+# tokenizer above. Nothing here is invented — every bullet is either a
+# sentence lifted verbatim from the source text, or an explicit
+# "not identifiable" note when the source doesn't contain that kind of
+# information.
+
+RISK_KEYWORDS = [
+    "penalty", "penalties", "liable", "liability", "breach", "default",
+    "terminate", "termination", "damages", "indemnif", "forfeit",
+    "void", "null and void", "non-compliance", "violation", "sanction",
+    "risk", "dispute", "litigation"
+]
+
+ACTION_KEYWORDS = [
+    "should", "recommend", "advise", "consider", "review", "consult",
+    "ensure", "notify", "submit", "file a", "must be filed", "required to notify"
+]
+
+OBLIGATION_PATTERN = re.compile(
+    r'([^.?!]{0,150}\b(?:shall|must|is required to|are required to|'
+    r'is obligated to|agrees to|undertakes to)\b[^.?!]{0,150}[.?!])',
+    re.IGNORECASE
+)
+
+CONDITION_PATTERN = re.compile(
+    r'([^.?!]{0,150}\b(?:provided that|unless|subject to|in the event that|'
+    r'conditional upon)\b[^.?!]{0,150}[.?!])',
+    re.IGNORECASE
+)
+
+DATE_PATTERN = re.compile(
+    r'\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}|'
+    r'(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4})\b',
+    re.IGNORECASE
+)
+
+
+def _dedupe(items, limit):
+    seen = set()
+    unique = []
+    for item in items:
+        item = item.strip()
+        if item and item not in seen:
+            seen.add(item)
+            unique.append(item)
+        if len(unique) >= limit:
+            break
+    return unique
+
+
+def generate_legal_suggestions(full_text, sents):
+    """
+    Builds context-grounded legal suggestions directly from the original
+    document text supplied by the user. Every item returned is either a
+    sentence/fragment extracted from that text, or an explicit note that
+    the information could not be found — nothing is fabricated.
+    """
+    legal_issues = _dedupe(
+        [s for s in sents if any(kw in s.lower() for kw in LEGAL_KEYWORDS)], 6
+    )
+
+    obligations = _dedupe(OBLIGATION_PATTERN.findall(full_text), 6)
+
+    risks = _dedupe(
+        [s for s in sents if any(kw in s.lower() for kw in RISK_KEYWORDS)], 6
+    )
+
+    conditions = _dedupe(CONDITION_PATTERN.findall(full_text), 6)
+    dates_found = _dedupe(DATE_PATTERN.findall(full_text), 6)
+
+    possible_actions = _dedupe(
+        [s for s in sents if any(kw in s.lower() for kw in ACTION_KEYWORDS)], 6
+    )
+
+    return {
+        "legal_issues": legal_issues,
+        "obligations": obligations,
+        "risks": risks,
+        "conditions": conditions,
+        "dates_found": dates_found,
+        "possible_actions": possible_actions,
+    }
+
+
+def render_legal_suggestions(full_text):
+    """Renders the '💡 Legal Suggestions' section in the Streamlit UI,
+    strictly from the original legal context (full_text)."""
+    sents = simple_sent_tokenize(full_text)
+    suggestions = generate_legal_suggestions(full_text, sents)
+
+    st.markdown("### 💡 Legal Suggestions")
+
+    has_any = any(suggestions.values())
+    if not has_any:
+        st.write(
+            "The provided document does not contain enough identifiable "
+            "information to generate specific legal suggestions."
+        )
+    else:
+        st.markdown("**Important legal issues or concerns**")
+        if suggestions["legal_issues"]:
+            for s in suggestions["legal_issues"]:
+                st.markdown(f"- {s}")
+        else:
+            st.markdown("- Not clearly identifiable from the provided context.")
+
+        st.markdown("**Key obligations or responsibilities**")
+        if suggestions["obligations"]:
+            for s in suggestions["obligations"]:
+                st.markdown(f"- {s}")
+        else:
+            st.markdown("- Not clearly identifiable from the provided context.")
+
+        st.markdown("**Potential risks or areas requiring attention**")
+        if suggestions["risks"]:
+            for s in suggestions["risks"]:
+                st.markdown(f"- {s}")
+        else:
+            st.markdown("- Not clearly identifiable from the provided context.")
+
+        st.markdown("**Important deadlines, conditions, or clauses**")
+        if suggestions["conditions"] or suggestions["dates_found"]:
+            for s in suggestions["conditions"]:
+                st.markdown(f"- {s}")
+            if suggestions["dates_found"]:
+                st.markdown(f"- Dates referenced in the document: {', '.join(suggestions['dates_found'])}")
+        else:
+            st.markdown("- Not clearly identifiable from the provided context.")
+
+        st.markdown("**Possible actions or considerations arising from the document**")
+        if suggestions["possible_actions"]:
+            for s in suggestions["possible_actions"]:
+                st.markdown(f"- {s}")
+        else:
+            st.markdown("- Not clearly identifiable from the provided context.")
+
+    st.divider()
+    st.caption(
+        "⚠️ These suggestions are generated automatically from the document "
+        "you provided, for informational purposes only, and do not "
+        "constitute legal advice. Please consult a qualified legal "
+        "professional for advice specific to your situation."
+    )
+
+
+# ============================================
+# 2c. REQUIREMENT ANALYSIS LOGIC (unchanged)
 # ============================================
 # No external LLM/API is available in this project, so the analysis below is
 # built entirely from the libraries already used elsewhere in the app
@@ -154,11 +304,7 @@ AMBIGUITY_MARKERS = [
     "flexible", "as needed", "if possible", "might", "could be", "roughly"
 ]
 
-DATE_PATTERN = re.compile(
-    r'\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}|'
-    r'(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4})\b',
-    re.IGNORECASE
-)
+REQ_DATE_PATTERN = DATE_PATTERN
 CURRENCY_PATTERN = re.compile(r'[\$₹€£]\s?\d[\d,]*(?:\.\d+)?')
 
 
@@ -231,7 +377,7 @@ def find_ambiguous_sentences(sentences):
 
 def find_contradictions(full_text):
     conflicts = []
-    dates = list(dict.fromkeys(DATE_PATTERN.findall(full_text)))
+    dates = list(dict.fromkeys(REQ_DATE_PATTERN.findall(full_text)))
     if len(dates) > 1:
         conflicts.append(f"Multiple different dates were mentioned ({', '.join(dates[:6])}). Please confirm which one applies.")
     amounts = list(dict.fromkeys(CURRENCY_PATTERN.findall(full_text)))
@@ -338,7 +484,7 @@ with st.sidebar:
 
 tab_summary, tab_requirements = st.tabs(["📝 Legal Summarization", "🧭 Requirement Analysis"])
 
-# ---------------- TAB 1: existing feature, unchanged ----------------
+# ---------------- TAB 1: Legal Summarization ----------------
 with tab_summary:
     st.markdown("### 📝 Input Legal Document")
     col_text, col_file = st.columns([4, 1])
@@ -367,17 +513,24 @@ with tab_summary:
             with st.spinner("Processing legal nodes and graph centrality..."):
                 summary = run_hi_legal_sum(input_text, k_val, w_sem, w_pos, w_tfidf, lambda_p)
 
-                st.success("Summary Generated!")
-                st.markdown("### 🔷 HiLegalSum Output")
-                for sent in summary:
-                    st.markdown(f"**•** {sent}")
+            # 1) HiLegalSum Output (existing algorithm output — unchanged)
+            st.success("Summary Generated!")
+            st.markdown("### 🔷 HiLegalSum Output")
+            for sent in summary:
+                st.markdown(f"**•** {sent}")
 
-                st.divider()
-                col1, col2 = st.columns(2)
-                col1.metric("Original Sentences", len(simple_sent_tokenize(input_text)))
-                col2.metric("Summary Sentences", len(summary))
+            # 2) Original / Summary statistics (existing — unchanged)
+            st.divider()
+            col1, col2 = st.columns(2)
+            col1.metric("Original Sentences", len(simple_sent_tokenize(input_text)))
+            col2.metric("Summary Sentences", len(summary))
 
-# ---------------- TAB 2: new Requirement Analysis feature ----------------
+            # 3) Legal Suggestions — NEW, generated from the ORIGINAL input_text,
+            #    always shown after the summary/stats, never a feedback prompt.
+            st.divider()
+            render_legal_suggestions(input_text)
+
+# ---------------- TAB 2: Requirement Analysis (unchanged) ----------------
 with tab_requirements:
     st.markdown("### 📝 Describe Your Requirement")
     req_description = st.text_area(
