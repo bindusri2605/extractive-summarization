@@ -85,23 +85,24 @@ def run_hi_legal_sum(text, k, w_sem, w_pos, w_tfidf, lambda_param):
 
 
 # ============================================
-# 2b. LEGAL SUGGESTIONS LOGIC (rule-based analysis, NOT sentence copying)
+# 2b. LEGAL SUGGESTIONS LOGIC (fact-anchored analysis, NOT keyword triggering)
 # ============================================
-# No external LLM/API is available in this project. Rather than lifting
-# whole sentences out of the document, this engine looks for specific
-# legal *patterns* (notice periods, payment windows, indemnification,
-# breach language, ambiguous terms, etc.) in the ORIGINAL user-provided
-# context and turns each detected pattern into a short, freshly-worded,
-# actionable insight (a question to verify, a risk to assess, a deadline
-# to calendar). Numbers/dates/keywords used in a template are always ones
-# actually found in the text -- nothing is invented -- but the sentence
-# itself is generated, not extracted.
+# No external LLM/API is available in this project. This engine deliberately
+# does NOT fire just because a generic legal word ("court", "appeal",
+# "breach", "some", ...) appears somewhere in the document. Each rule below
+# requires a keyword AND a concrete, nearby anchor fact -- a day count, a
+# date, a currency amount, a percentage, a named clause/section, a named
+# law, a named jurisdiction, a specific ground, a specific duration, etc.
+# Only when both the keyword and its anchor are found does a suggestion get
+# generated, and the suggestion always names the specific fact it found so
+# the reader can see exactly what triggered it. If a keyword appears with no
+# such anchor nearby, nothing is generated for it -- that avoids generic,
+# could-apply-to-any-document suggestions.
 
 AMBIGUITY_MARKERS = [
-    "tbd", "to be decided", "maybe", "possibly", "not sure", "unsure",
-    "some", "several", "various", "etc", "approximately", "around",
-    "flexible", "as needed", "if possible", "might", "could be", "roughly",
-    "reasonable"
+    "tbd", "to be decided", "not sure", "unsure", "flexible",
+    "as needed", "if possible", "might", "could be", "roughly",
+    "reasonable efforts", "best efforts", "approximately"
 ]
 
 DATE_PATTERN = re.compile(
@@ -110,36 +111,26 @@ DATE_PATTERN = re.compile(
     re.IGNORECASE
 )
 CURRENCY_PATTERN = re.compile(r'[\$₹€£]\s?\d[\d,]*(?:\.\d+)?')
+PERCENT_PATTERN = re.compile(r'\b\d{1,3}(?:\.\d+)?\s?%')
 
-NOTICE_TERMINATION_PATTERN = re.compile(
-    r'(\d{1,3})\s*-?\s*(?:day|days)\b(?:(?![.!?]).){0,150}?\bterminat\w*\b'
-    r'|\bterminat\w*\b(?:(?![.!?]).){0,150}?(\d{1,3})\s*-?\s*(?:day|days)\b',
-    re.IGNORECASE | re.DOTALL
-)
-PAYMENT_DEADLINE_PATTERN = re.compile(
-    r'(\d{1,3})\s*-?\s*(?:day|days)\b(?:(?![.!?]).){0,150}?\bpa(?:y|yment)\w*\b'
-    r'|\bpa(?:y|yment)\w*\b(?:(?![.!?]).){0,150}?(\d{1,3})\s*-?\s*(?:day|days)\b',
-    re.IGNORECASE | re.DOTALL
-)
-MODAL_VERB_PATTERN = re.compile(r'\b(?:shall|must)\s+(\w+)', re.IGNORECASE)
-
+_WIN = r'(?:(?![.!?]).){0,140}?'  # bounded "same sentence-ish" window, non-greedy
 
 def _first_group(match):
     if not match:
         return None
     for g in match.groups():
         if g:
-            return g
+            return g.strip()
     return None
 
 
 def analyze_legal_context(full_text):
     """
-    Rule-based analysis of the ORIGINAL legal context. Returns a dict of
-    category -> list of short, generated insight strings (2-4 each where
-    the source supports it). Every insight is grounded in a keyword,
-    number, or date actually present in the text, but is phrased as an
-    action/consideration rather than copied verbatim from the source.
+    Fact-anchored analysis of the ORIGINAL legal context. A suggestion is
+    only produced when a keyword AND a concrete supporting fact are both
+    found near each other in the text -- bare keyword presence alone never
+    produces a suggestion. Returns dict: category -> list of insight strings
+    (2-4 each, capped, de-duplicated), each naming the specific fact found.
     """
     low = full_text.lower()
     dates = list(dict.fromkeys(DATE_PATTERN.findall(full_text)))
@@ -152,127 +143,226 @@ def analyze_legal_context(full_text):
         "Important Deadlines / Clauses": [],
         "Recommended Considerations": [],
     }
-    flags = {"has_deadline": False, "has_risk": False, "has_obligation": False}
+    # collected specific tokens, used to make Recommended Considerations
+    # concrete rather than generic boilerplate
+    deadline_specifics, risk_specifics, obligation_specifics = [], [], []
 
     # ---------- Important Legal Issues ----------
-    if any(kw in low for kw in ["court", "plaintiff", "defendant", "appeal", "judgment", "order"]):
+    # Litigation terms only matter here if tied to a specific clause reference.
+    m = re.search(
+        r'\b(court|plaintiff|defendant|appeal|judgment)\b' + _WIN + r'\b(?:Section|Article|Clause)\s+(\d+(?:\.\d+)*)\b'
+        r'|\b(?:Section|Article|Clause)\s+(\d+(?:\.\d+)*)\b' + _WIN + r'\b(court|plaintiff|defendant|appeal|judgment)\b',
+        full_text, re.IGNORECASE
+    )
+    if m:
+        clause_num = m.group(2) or m.group(3)
         categories["Important Legal Issues"].append(
-            "Litigation-related terms appear (e.g., court, appeal, judgment) -- confirm any related procedural deadlines and the applicable jurisdiction are being tracked."
+            f"Litigation-related language is tied to Section/Clause {clause_num} — confirm the procedural steps and deadlines set out there are being followed before any court action is pursued."
         )
-    if any(kw in low for kw in ["compliance", "regulation", "regulatory", "statute", "gdpr"]):
+
+    # Compliance only matters here if a specific named law/regulation is identifiable.
+    named_law = re.search(
+        r'\b([A-Z][A-Za-z]+(?:\s[A-Z][A-Za-z]+){0,4}\s(?:Act|Regulation|Code|Directive))\b|\b(GDPR|HIPAA|CCPA)\b',
+        full_text
+    )
+    if named_law:
+        law_name = named_law.group(1) or named_law.group(2)
         categories["Important Legal Issues"].append(
-            "Regulatory or statutory compliance is referenced -- verify current compliance status, since non-compliance can carry penalties or affect enforceability."
+            f"The document is subject to {law_name} — confirm current compliance, since this specific law (not a generic compliance clause) governs how violations are treated."
         )
+
     if len(dates) > 1:
         categories["Important Legal Issues"].append(
-            f"Multiple distinct dates appear in the document ({', '.join(dates[:4])}); confirm which one governs to avoid conflicting interpretations."
+            f"The document states multiple different dates ({', '.join(dates[:4])}) — confirm which one actually governs, since relying on the wrong one could misstate a deadline or effective date."
         )
     if len(amounts) > 1:
         categories["Important Legal Issues"].append(
-            f"Multiple differing monetary figures appear ({', '.join(amounts[:4])}); confirm which figure is authoritative."
+            f"The document states multiple different monetary figures ({', '.join(amounts[:4])}) — confirm which figure is authoritative before relying on either."
         )
-    if "confidential" in low:
+
+    conf_m = re.search(
+        r'\bconfidential\w*\b' + _WIN + r'(\d{1,3}\s?(?:year|years|month|months))\b'
+        r'|(\d{1,3}\s?(?:year|years|month|months))\b' + _WIN + r'\bconfidential\w*\b',
+        full_text, re.IGNORECASE
+    )
+    if conf_m:
+        dur = _first_group(conf_m)
         categories["Important Legal Issues"].append(
-            "Confidentiality provisions are present -- confirm the scope of protected information and how long the obligation survives after the agreement ends."
+            f"Confidentiality obligations run for {dur} — confirm this duration and whether it survives after the agreement ends, since disclosure after that window may fall outside protection."
         )
 
     # ---------- Key Obligations ----------
-    modal_matches = MODAL_VERB_PATTERN.findall(full_text)
-    seen_verbs = []
-    for v in modal_matches:
-        v = v.lower()
-        if v not in seen_verbs and v not in ("be", "not"):
-            seen_verbs.append(v)
-    if seen_verbs:
-        flags["has_obligation"] = True
-        for v in seen_verbs[:3]:
-            categories["Key Obligations"].append(
-                f"A mandatory obligation involving '{v}' is specified using 'shall'/'must' language -- confirm which party is responsible and whether it has actually been satisfied."
-            )
-    if "assign" in low:
+    # Only include a modal-verb obligation when it has an identifiable, non-trivial action attached.
+    obligation_hits = []
+    for om in re.finditer(r'\b(?:shall|must)\s+((?:(?!\b(?:shall|must)\b)[^,.;]){3,90})', full_text, re.IGNORECASE):
+        phrase = om.group(1).strip()
+        phrase = re.sub(r'\s+', ' ', phrase)
+        # Skip phrases that are really about a day-count deadline (notice/payment/etc.) --
+        # those are already surfaced under "Important Deadlines / Clauses" and repeating
+        # them here would duplicate the same point across two categories.
+        if len(phrase.split()) >= 3 and not re.search(r'\b\d{1,3}\s*-?\s*days?\b', phrase, re.IGNORECASE):
+            obligation_hits.append(phrase)
+    seen_ob = []
+    for p in obligation_hits:
+        low_p = p.lower()
+        if low_p not in seen_ob:
+            seen_ob.append(low_p)
+    for phrase in seen_ob[:3]:
+        obligation_specifics.append(phrase)
         categories["Key Obligations"].append(
-            "Assignment of rights or obligations is addressed -- confirm whether prior written consent is required before assigning to a third party."
+            f"The document imposes a mandatory obligation to {phrase} — confirm which party is responsible for this and whether it has actually been carried out."
         )
-    if "indemnif" in low:
+
+    assign_m = re.search(
+        r'\bassign\w*\b' + _WIN + r'\b(written consent|prior consent|consent of|prior written approval)\b'
+        r'|\b(written consent|prior consent|consent of|prior written approval)\b' + _WIN + r'\bassign\w*\b',
+        full_text, re.IGNORECASE
+    )
+    if assign_m:
+        req = _first_group(assign_m)
         categories["Key Obligations"].append(
-            "An indemnification obligation is present -- identify which party must indemnify the other, and for what scope of claims or losses."
+            f"Assignment of rights or obligations requires {req} — confirm that requirement was actually obtained before treating any assignment as valid."
+        )
+
+    indem_m = re.search(
+        r'\bindemnif\w*\b' + _WIN + r'\b(third[- ]part(?:y|ies)|losses|claims|attorney(?:s)?\'?\s?fees)\b',
+        full_text, re.IGNORECASE
+    )
+    if indem_m:
+        scope = indem_m.group(1)
+        categories["Key Obligations"].append(
+            f"An indemnification obligation specifically covers {scope} — identify which party bears this obligation and confirm the scope matches what actually occurred."
         )
 
     # ---------- Potential Risks ----------
-    if any(kw in low for kw in ["breach", "default"]):
-        flags["has_risk"] = True
+    breach_m = re.search(
+        r'\b(?:breach|default)\w*\b' + _WIN + r'\b(cure period|cure|remedy|remedies|\d{1,3}\s?days?\s?(?:to cure|notice))\b',
+        full_text, re.IGNORECASE
+    )
+    if breach_m:
+        detail = breach_m.group(1)
+        risk_specifics.append(f"breach/default — {detail}")
         categories["Potential Risks"].append(
-            "Breach or default language is present -- determine what specifically constitutes a breach and whether a cure period applies before remedies can be pursued."
+            f"A breach/default clause is tied to a specific '{detail}' provision — confirm the exact cure procedure and timeline before any remedy is pursued."
         )
-    if any(kw in low for kw in ["penalty", "penalties", "damages", "forfeit"]):
-        flags["has_risk"] = True
+
+    penalty_m = re.search(
+        r'\b(?:penalty|penalties|damages|forfeit\w*)\b' + _WIN +
+        r'([\$₹€£]\s?\d[\d,]*(?:\.\d+)?|\d{1,3}(?:\.\d+)?\s?%)'
+        r'|([\$₹€£]\s?\d[\d,]*(?:\.\d+)?|\d{1,3}(?:\.\d+)?\s?%)' + _WIN + r'\b(?:penalty|penalties|damages|forfeit\w*)\b',
+        full_text, re.IGNORECASE
+    )
+    if penalty_m:
+        amt = _first_group(penalty_m)
+        risk_specifics.append(f"penalty/damages of {amt}")
         categories["Potential Risks"].append(
-            "Financial penalties or damages are referenced -- assess the potential monetary exposure if the triggering condition occurs."
+            f"A penalty/damages provision specifies {amt} — assess this exact exposure against the value of the underlying obligation to judge how material the risk is."
         )
-    if any(kw in low for kw in ["liable", "liability"]):
-        flags["has_risk"] = True
+
+    liab_m = re.search(
+        r'\b(?:liabl|liabilit)\w*\b' + _WIN +
+        r'([\$₹€£]\s?\d[\d,]*(?:\.\d+)?|gross negligence|willful misconduct|cap(?:ped)?\s?at\s?[\$₹€£]?\s?\d[\d,]*)',
+        full_text, re.IGNORECASE
+    )
+    if liab_m:
+        detail = liab_m.group(1)
+        risk_specifics.append(f"liability tied to {detail}")
         categories["Potential Risks"].append(
-            "Liability terms are present -- check whether a liability cap or exclusion applies, since this directly affects total financial exposure."
+            f"Liability is specifically tied to {detail} — confirm whether this cap or carve-out would actually cover a realistic loss scenario under this agreement."
         )
-    if "terminat" in low and not NOTICE_TERMINATION_PATTERN.search(full_text):
-        flags["has_risk"] = True
+
+    ground_m = re.search(
+        r'\bterminat\w*\b' + _WIN + r'\b(for cause|for convenience|material breach|without cause)\b',
+        full_text, re.IGNORECASE
+    )
+    if ground_m:
+        ground = ground_m.group(1)
+        risk_specifics.append(f"termination {ground}")
         categories["Potential Risks"].append(
-            "Termination rights are described -- invoking termination without meeting the stated conditions could itself expose a party to a breach claim."
+            f"Termination is permitted '{ground}' — confirm the specific conditions for this ground were actually met, since invoking it without meeting them can itself be treated as a breach."
         )
 
     # ---------- Important Deadlines / Clauses ----------
-    notice_days = _first_group(NOTICE_TERMINATION_PATTERN.search(full_text))
+    notice_m = re.search(
+        r'(\d{1,3})\s*-?\s*(?:day|days)\b' + _WIN + r'\bterminat\w*\b'
+        r'|\bterminat\w*\b' + _WIN + r'(\d{1,3})\s*-?\s*(?:day|days)\b',
+        full_text, re.IGNORECASE
+    )
+    notice_days = _first_group(notice_m)
     if notice_days:
-        flags["has_deadline"] = True
+        deadline_specifics.append(f"{notice_days}-day notice-before-termination")
         categories["Important Deadlines / Clauses"].append(
-            f"Verify whether the {notice_days}-day notice requirement was properly complied with before any termination action was taken -- missing this window can make a termination invalid."
-        )
-    payment_days = _first_group(PAYMENT_DEADLINE_PATTERN.search(full_text))
-    if payment_days:
-        flags["has_deadline"] = True
-        categories["Important Deadlines / Clauses"].append(
-            f"Confirm payment was made within the {payment_days}-day window specified -- a late payment can trigger penalty, interest, or default provisions."
-        )
-    if any(kw in low for kw in ["renew", "renewal"]):
-        flags["has_deadline"] = True
-        categories["Important Deadlines / Clauses"].append(
-            "An auto-renewal or renewal term is present -- confirm the deadline to opt out, since missing it may result in an unwanted extension."
-        )
-    if "force majeure" in low:
-        categories["Important Deadlines / Clauses"].append(
-            "A force majeure clause is present -- check whether it covers the specific circumstances at issue, since coverage varies significantly between agreements."
-        )
-    if any(kw in low for kw in ["arbitrat", "governing law", "jurisdiction"]):
-        categories["Important Deadlines / Clauses"].append(
-            "Governing law or dispute-resolution terms are specified -- note the required forum and procedure, since this determines how any conflict must be pursued."
-        )
-    if dates and not notice_days and not payment_days:
-        flags["has_deadline"] = True
-        categories["Important Deadlines / Clauses"].append(
-            f"A specific date is referenced ({dates[0]}) -- confirm what obligation or deadline it corresponds to and calendar it accordingly."
+            f"Termination requires a {notice_days}-day notice period first — verify that notice was actually given and that this exact window elapsed before termination was carried out."
         )
 
-    # ---------- Recommended Considerations (synthesized, distinct from the above) ----------
+    payment_m = re.search(
+        r'(\d{1,3})\s*-?\s*(?:day|days)\b' + _WIN + r'\bpa(?:y|yment)\w*\b'
+        r'|\bpa(?:y|yment)\w*\b' + _WIN + r'(\d{1,3})\s*-?\s*(?:day|days)\b',
+        full_text, re.IGNORECASE
+    )
+    payment_days = _first_group(payment_m)
+    if payment_days:
+        deadline_specifics.append(f"{payment_days}-day payment window")
+        categories["Important Deadlines / Clauses"].append(
+            f"Payment is due within {payment_days} days — confirm whether payment was made inside that exact window, since this specific clause (not a general delay) is what triggers late-payment consequences."
+        )
+
+    renew_m = re.search(
+        r'\brenew\w*\b' + _WIN + r'(\d{1,3}\s*-?\s*(?:day|days))\b'
+        r'|\brenew\w*\b' + _WIN + r'\b(successive|automatic\w*)\b',
+        full_text, re.IGNORECASE
+    )
+    if renew_m:
+        detail = _first_group(renew_m)
+        deadline_specifics.append(f"renewal — {detail}")
+        categories["Important Deadlines / Clauses"].append(
+            f"The renewal clause specifically involves {detail} — confirm the exact deadline/method to opt out, since missing it would trigger this specific renewal mechanism."
+        )
+
+    fm_m = re.search(
+        r'\bforce majeure\b' + _WIN + r'\b(natural disaster|pandemic|epidemic|war|strike|act of god|government action|labou?r dispute)\b',
+        full_text, re.IGNORECASE
+    )
+    if fm_m:
+        cause = fm_m.group(1)
+        categories["Important Deadlines / Clauses"].append(
+            f"The force majeure clause specifically lists '{cause}' as a covered event — confirm whether the actual circumstances at issue fall within this named list, since unlisted events may not be covered."
+        )
+
+    law_m = re.search(
+        r'\b(?:governing law|laws of|jurisdiction of)\b' + _WIN + r'\b(?:State of\s+)?([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)?)\b'
+        r'|\b(AAA|ICC|American Arbitration Association|International Chamber of Commerce)\b',
+        full_text
+    )
+    if law_m:
+        forum = law_m.group(1) or law_m.group(2)
+        categories["Important Deadlines / Clauses"].append(
+            f"The document specifies {forum} as the governing law/forum — confirm this is the forum actually being used, since disputes filed elsewhere may not be enforceable under this clause."
+        )
+
+    if dates and not notice_days and not payment_days:
+        deadline_specifics.append(f"date {dates[0]}")
+        categories["Important Deadlines / Clauses"].append(
+            f"The document references the specific date {dates[0]} — confirm exactly what obligation or deadline attaches to it and calendar it accordingly."
+        )
+
+    # ---------- Recommended Considerations (built from what was actually found) ----------
     ambiguity_hits = [m for m in AMBIGUITY_MARKERS if re.search(rf'\b{re.escape(m)}\b', low)]
     if ambiguity_hits:
         categories["Recommended Considerations"].append(
-            f"Vague or undefined terms appear (e.g., '{ambiguity_hits[0]}') -- seek clarification in writing to reduce the risk of differing interpretations later."
+            f"The document uses the undefined term '{ambiguity_hits[0]}' rather than a fixed standard — seek written clarification of what this specifically requires, since it's open to differing interpretation."
         )
-    if flags["has_deadline"]:
+    if deadline_specifics:
         categories["Recommended Considerations"].append(
-            "Calendar all identified deadlines and notice windows now, so none are inadvertently missed."
+            f"Calendar the specific deadlines identified in this document ({'; '.join(deadline_specifics[:3])}), since each is tied to a distinct consequence if missed."
         )
-    if flags["has_risk"]:
+    if risk_specifics:
         categories["Recommended Considerations"].append(
-            "Given the risk provisions identified, consider having a qualified attorney assess potential exposure before taking further action."
+            f"Given the specific risk provisions identified ({'; '.join(risk_specifics[:3])}), consider having a qualified attorney assess actual exposure under these exact terms before taking further action."
         )
-    if flags["has_obligation"]:
+    if obligation_specifics:
         categories["Recommended Considerations"].append(
-            "Retain documentation showing fulfillment of the obligations identified, in case compliance is later disputed."
-        )
-    if not any(categories.values()):
-        categories["Recommended Considerations"].append(
-            "The provided context is limited -- supplying the full document or additional clauses would allow a more complete analysis."
+            f"Retain documentation showing performance of the specific obligations identified ({'; '.join(obligation_specifics[:3])}), in case compliance with these exact terms is later disputed."
         )
 
     # de-duplicate and cap each category to 2-4 items
@@ -288,16 +378,17 @@ def analyze_legal_context(full_text):
 
 
 def render_legal_suggestions(full_text):
-    """Renders the '💡 Legal Suggestions' section, analyzing (not quoting)
-    the original legal context supplied by the user."""
+    """Renders the '💡 Legal Suggestions' section. Only fact-anchored,
+    document-specific insights are shown; a category with no anchored
+    finding says so explicitly rather than filling in generic advice."""
     st.markdown("### 💡 Legal Suggestions")
 
     categories = analyze_legal_context(full_text)
 
     if not any(categories.values()):
         st.write(
-            "The provided document does not contain enough identifiable "
-            "information to generate specific legal suggestions."
+            "No suggestions with sufficient specific grounding (dates, amounts, "
+            "named clauses, defined terms, etc.) were found in the provided text."
         )
     else:
         for cat_name, items in categories.items():
@@ -306,7 +397,7 @@ def render_legal_suggestions(full_text):
                 for it in items:
                     st.markdown(f"- {it}")
             else:
-                st.markdown("- No specific concerns identified in this category based on the provided context.")
+                st.markdown("- No specific, fact-anchored issue was identified in this category from the provided context.")
 
     st.divider()
     st.caption(
