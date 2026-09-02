@@ -85,152 +85,233 @@ def run_hi_legal_sum(text, k, w_sem, w_pos, w_tfidf, lambda_param):
 
 
 # ============================================
-# 2b. LEGAL SUGGESTIONS LOGIC (NEW)
+# 2b. LEGAL SUGGESTIONS LOGIC (rule-based analysis, NOT sentence copying)
 # ============================================
-# No external LLM/API is available in this project, so the suggestions below
-# are derived directly, and only, from the user's ORIGINAL legal context
-# using regex/keyword rules and the sentence list already produced by the
-# tokenizer above. Nothing here is invented — every bullet is either a
-# sentence lifted verbatim from the source text, or an explicit
-# "not identifiable" note when the source doesn't contain that kind of
-# information.
+# No external LLM/API is available in this project. Rather than lifting
+# whole sentences out of the document, this engine looks for specific
+# legal *patterns* (notice periods, payment windows, indemnification,
+# breach language, ambiguous terms, etc.) in the ORIGINAL user-provided
+# context and turns each detected pattern into a short, freshly-worded,
+# actionable insight (a question to verify, a risk to assess, a deadline
+# to calendar). Numbers/dates/keywords used in a template are always ones
+# actually found in the text -- nothing is invented -- but the sentence
+# itself is generated, not extracted.
 
-RISK_KEYWORDS = [
-    "penalty", "penalties", "liable", "liability", "breach", "default",
-    "terminate", "termination", "damages", "indemnif", "forfeit",
-    "void", "null and void", "non-compliance", "violation", "sanction",
-    "risk", "dispute", "litigation"
+AMBIGUITY_MARKERS = [
+    "tbd", "to be decided", "maybe", "possibly", "not sure", "unsure",
+    "some", "several", "various", "etc", "approximately", "around",
+    "flexible", "as needed", "if possible", "might", "could be", "roughly",
+    "reasonable"
 ]
-
-ACTION_KEYWORDS = [
-    "should", "recommend", "advise", "consider", "review", "consult",
-    "ensure", "notify", "submit", "file a", "must be filed", "required to notify"
-]
-
-OBLIGATION_PATTERN = re.compile(
-    r'([^.?!]{0,150}\b(?:shall|must|is required to|are required to|'
-    r'is obligated to|agrees to|undertakes to)\b[^.?!]{0,150}[.?!])',
-    re.IGNORECASE
-)
-
-CONDITION_PATTERN = re.compile(
-    r'([^.?!]{0,150}\b(?:provided that|unless|subject to|in the event that|'
-    r'conditional upon)\b[^.?!]{0,150}[.?!])',
-    re.IGNORECASE
-)
 
 DATE_PATTERN = re.compile(
     r'\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}|'
     r'(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4})\b',
     re.IGNORECASE
 )
+CURRENCY_PATTERN = re.compile(r'[\$₹€£]\s?\d[\d,]*(?:\.\d+)?')
+
+NOTICE_TERMINATION_PATTERN = re.compile(
+    r'(\d{1,3})\s*-?\s*(?:day|days)\b(?:(?![.!?]).){0,150}?\bterminat\w*\b'
+    r'|\bterminat\w*\b(?:(?![.!?]).){0,150}?(\d{1,3})\s*-?\s*(?:day|days)\b',
+    re.IGNORECASE | re.DOTALL
+)
+PAYMENT_DEADLINE_PATTERN = re.compile(
+    r'(\d{1,3})\s*-?\s*(?:day|days)\b(?:(?![.!?]).){0,150}?\bpa(?:y|yment)\w*\b'
+    r'|\bpa(?:y|yment)\w*\b(?:(?![.!?]).){0,150}?(\d{1,3})\s*-?\s*(?:day|days)\b',
+    re.IGNORECASE | re.DOTALL
+)
+MODAL_VERB_PATTERN = re.compile(r'\b(?:shall|must)\s+(\w+)', re.IGNORECASE)
 
 
-def _dedupe(items, limit):
-    seen = set()
-    unique = []
-    for item in items:
-        item = item.strip()
-        if item and item not in seen:
-            seen.add(item)
-            unique.append(item)
-        if len(unique) >= limit:
-            break
-    return unique
+def _first_group(match):
+    if not match:
+        return None
+    for g in match.groups():
+        if g:
+            return g
+    return None
 
 
-def generate_legal_suggestions(full_text, sents):
+def analyze_legal_context(full_text):
     """
-    Builds context-grounded legal suggestions directly from the original
-    document text supplied by the user. Every item returned is either a
-    sentence/fragment extracted from that text, or an explicit note that
-    the information could not be found — nothing is fabricated.
+    Rule-based analysis of the ORIGINAL legal context. Returns a dict of
+    category -> list of short, generated insight strings (2-4 each where
+    the source supports it). Every insight is grounded in a keyword,
+    number, or date actually present in the text, but is phrased as an
+    action/consideration rather than copied verbatim from the source.
     """
-    legal_issues = _dedupe(
-        [s for s in sents if any(kw in s.lower() for kw in LEGAL_KEYWORDS)], 6
-    )
+    low = full_text.lower()
+    dates = list(dict.fromkeys(DATE_PATTERN.findall(full_text)))
+    amounts = list(dict.fromkeys(CURRENCY_PATTERN.findall(full_text)))
 
-    obligations = _dedupe(OBLIGATION_PATTERN.findall(full_text), 6)
-
-    risks = _dedupe(
-        [s for s in sents if any(kw in s.lower() for kw in RISK_KEYWORDS)], 6
-    )
-
-    conditions = _dedupe(CONDITION_PATTERN.findall(full_text), 6)
-    dates_found = _dedupe(DATE_PATTERN.findall(full_text), 6)
-
-    possible_actions = _dedupe(
-        [s for s in sents if any(kw in s.lower() for kw in ACTION_KEYWORDS)], 6
-    )
-
-    return {
-        "legal_issues": legal_issues,
-        "obligations": obligations,
-        "risks": risks,
-        "conditions": conditions,
-        "dates_found": dates_found,
-        "possible_actions": possible_actions,
+    categories = {
+        "Important Legal Issues": [],
+        "Key Obligations": [],
+        "Potential Risks": [],
+        "Important Deadlines / Clauses": [],
+        "Recommended Considerations": [],
     }
+    flags = {"has_deadline": False, "has_risk": False, "has_obligation": False}
+
+    # ---------- Important Legal Issues ----------
+    if any(kw in low for kw in ["court", "plaintiff", "defendant", "appeal", "judgment", "order"]):
+        categories["Important Legal Issues"].append(
+            "Litigation-related terms appear (e.g., court, appeal, judgment) -- confirm any related procedural deadlines and the applicable jurisdiction are being tracked."
+        )
+    if any(kw in low for kw in ["compliance", "regulation", "regulatory", "statute", "gdpr"]):
+        categories["Important Legal Issues"].append(
+            "Regulatory or statutory compliance is referenced -- verify current compliance status, since non-compliance can carry penalties or affect enforceability."
+        )
+    if len(dates) > 1:
+        categories["Important Legal Issues"].append(
+            f"Multiple distinct dates appear in the document ({', '.join(dates[:4])}); confirm which one governs to avoid conflicting interpretations."
+        )
+    if len(amounts) > 1:
+        categories["Important Legal Issues"].append(
+            f"Multiple differing monetary figures appear ({', '.join(amounts[:4])}); confirm which figure is authoritative."
+        )
+    if "confidential" in low:
+        categories["Important Legal Issues"].append(
+            "Confidentiality provisions are present -- confirm the scope of protected information and how long the obligation survives after the agreement ends."
+        )
+
+    # ---------- Key Obligations ----------
+    modal_matches = MODAL_VERB_PATTERN.findall(full_text)
+    seen_verbs = []
+    for v in modal_matches:
+        v = v.lower()
+        if v not in seen_verbs and v not in ("be", "not"):
+            seen_verbs.append(v)
+    if seen_verbs:
+        flags["has_obligation"] = True
+        for v in seen_verbs[:3]:
+            categories["Key Obligations"].append(
+                f"A mandatory obligation involving '{v}' is specified using 'shall'/'must' language -- confirm which party is responsible and whether it has actually been satisfied."
+            )
+    if "assign" in low:
+        categories["Key Obligations"].append(
+            "Assignment of rights or obligations is addressed -- confirm whether prior written consent is required before assigning to a third party."
+        )
+    if "indemnif" in low:
+        categories["Key Obligations"].append(
+            "An indemnification obligation is present -- identify which party must indemnify the other, and for what scope of claims or losses."
+        )
+
+    # ---------- Potential Risks ----------
+    if any(kw in low for kw in ["breach", "default"]):
+        flags["has_risk"] = True
+        categories["Potential Risks"].append(
+            "Breach or default language is present -- determine what specifically constitutes a breach and whether a cure period applies before remedies can be pursued."
+        )
+    if any(kw in low for kw in ["penalty", "penalties", "damages", "forfeit"]):
+        flags["has_risk"] = True
+        categories["Potential Risks"].append(
+            "Financial penalties or damages are referenced -- assess the potential monetary exposure if the triggering condition occurs."
+        )
+    if any(kw in low for kw in ["liable", "liability"]):
+        flags["has_risk"] = True
+        categories["Potential Risks"].append(
+            "Liability terms are present -- check whether a liability cap or exclusion applies, since this directly affects total financial exposure."
+        )
+    if "terminat" in low and not NOTICE_TERMINATION_PATTERN.search(full_text):
+        flags["has_risk"] = True
+        categories["Potential Risks"].append(
+            "Termination rights are described -- invoking termination without meeting the stated conditions could itself expose a party to a breach claim."
+        )
+
+    # ---------- Important Deadlines / Clauses ----------
+    notice_days = _first_group(NOTICE_TERMINATION_PATTERN.search(full_text))
+    if notice_days:
+        flags["has_deadline"] = True
+        categories["Important Deadlines / Clauses"].append(
+            f"Verify whether the {notice_days}-day notice requirement was properly complied with before any termination action was taken -- missing this window can make a termination invalid."
+        )
+    payment_days = _first_group(PAYMENT_DEADLINE_PATTERN.search(full_text))
+    if payment_days:
+        flags["has_deadline"] = True
+        categories["Important Deadlines / Clauses"].append(
+            f"Confirm payment was made within the {payment_days}-day window specified -- a late payment can trigger penalty, interest, or default provisions."
+        )
+    if any(kw in low for kw in ["renew", "renewal"]):
+        flags["has_deadline"] = True
+        categories["Important Deadlines / Clauses"].append(
+            "An auto-renewal or renewal term is present -- confirm the deadline to opt out, since missing it may result in an unwanted extension."
+        )
+    if "force majeure" in low:
+        categories["Important Deadlines / Clauses"].append(
+            "A force majeure clause is present -- check whether it covers the specific circumstances at issue, since coverage varies significantly between agreements."
+        )
+    if any(kw in low for kw in ["arbitrat", "governing law", "jurisdiction"]):
+        categories["Important Deadlines / Clauses"].append(
+            "Governing law or dispute-resolution terms are specified -- note the required forum and procedure, since this determines how any conflict must be pursued."
+        )
+    if dates and not notice_days and not payment_days:
+        flags["has_deadline"] = True
+        categories["Important Deadlines / Clauses"].append(
+            f"A specific date is referenced ({dates[0]}) -- confirm what obligation or deadline it corresponds to and calendar it accordingly."
+        )
+
+    # ---------- Recommended Considerations (synthesized, distinct from the above) ----------
+    ambiguity_hits = [m for m in AMBIGUITY_MARKERS if re.search(rf'\b{re.escape(m)}\b', low)]
+    if ambiguity_hits:
+        categories["Recommended Considerations"].append(
+            f"Vague or undefined terms appear (e.g., '{ambiguity_hits[0]}') -- seek clarification in writing to reduce the risk of differing interpretations later."
+        )
+    if flags["has_deadline"]:
+        categories["Recommended Considerations"].append(
+            "Calendar all identified deadlines and notice windows now, so none are inadvertently missed."
+        )
+    if flags["has_risk"]:
+        categories["Recommended Considerations"].append(
+            "Given the risk provisions identified, consider having a qualified attorney assess potential exposure before taking further action."
+        )
+    if flags["has_obligation"]:
+        categories["Recommended Considerations"].append(
+            "Retain documentation showing fulfillment of the obligations identified, in case compliance is later disputed."
+        )
+    if not any(categories.values()):
+        categories["Recommended Considerations"].append(
+            "The provided context is limited -- supplying the full document or additional clauses would allow a more complete analysis."
+        )
+
+    # de-duplicate and cap each category to 2-4 items
+    for cat in categories:
+        seen, unique = set(), []
+        for item in categories[cat]:
+            if item not in seen:
+                seen.add(item)
+                unique.append(item)
+        categories[cat] = unique[:4]
+
+    return categories
 
 
 def render_legal_suggestions(full_text):
-    """Renders the '💡 Legal Suggestions' section in the Streamlit UI,
-    strictly from the original legal context (full_text)."""
-    sents = simple_sent_tokenize(full_text)
-    suggestions = generate_legal_suggestions(full_text, sents)
-
+    """Renders the '💡 Legal Suggestions' section, analyzing (not quoting)
+    the original legal context supplied by the user."""
     st.markdown("### 💡 Legal Suggestions")
 
-    has_any = any(suggestions.values())
-    if not has_any:
+    categories = analyze_legal_context(full_text)
+
+    if not any(categories.values()):
         st.write(
             "The provided document does not contain enough identifiable "
             "information to generate specific legal suggestions."
         )
     else:
-        st.markdown("**Important legal issues or concerns**")
-        if suggestions["legal_issues"]:
-            for s in suggestions["legal_issues"]:
-                st.markdown(f"- {s}")
-        else:
-            st.markdown("- Not clearly identifiable from the provided context.")
-
-        st.markdown("**Key obligations or responsibilities**")
-        if suggestions["obligations"]:
-            for s in suggestions["obligations"]:
-                st.markdown(f"- {s}")
-        else:
-            st.markdown("- Not clearly identifiable from the provided context.")
-
-        st.markdown("**Potential risks or areas requiring attention**")
-        if suggestions["risks"]:
-            for s in suggestions["risks"]:
-                st.markdown(f"- {s}")
-        else:
-            st.markdown("- Not clearly identifiable from the provided context.")
-
-        st.markdown("**Important deadlines, conditions, or clauses**")
-        if suggestions["conditions"] or suggestions["dates_found"]:
-            for s in suggestions["conditions"]:
-                st.markdown(f"- {s}")
-            if suggestions["dates_found"]:
-                st.markdown(f"- Dates referenced in the document: {', '.join(suggestions['dates_found'])}")
-        else:
-            st.markdown("- Not clearly identifiable from the provided context.")
-
-        st.markdown("**Possible actions or considerations arising from the document**")
-        if suggestions["possible_actions"]:
-            for s in suggestions["possible_actions"]:
-                st.markdown(f"- {s}")
-        else:
-            st.markdown("- Not clearly identifiable from the provided context.")
+        for cat_name, items in categories.items():
+            st.markdown(f"**{cat_name}**")
+            if items:
+                for it in items:
+                    st.markdown(f"- {it}")
+            else:
+                st.markdown("- No specific concerns identified in this category based on the provided context.")
 
     st.divider()
     st.caption(
-        "⚠️ These suggestions are generated automatically from the document "
-        "you provided, for informational purposes only, and do not "
-        "constitute legal advice. Please consult a qualified legal "
-        "professional for advice specific to your situation."
+        "These suggestions are generated from the provided document for "
+        "informational purposes only and do not constitute legal advice."
     )
 
 
@@ -297,15 +378,6 @@ REQUIREMENT_CATEGORIES = {
         "suggestion": "Identify the data sources now so access/permissions can be arranged early."
     },
 }
-
-AMBIGUITY_MARKERS = [
-    "tbd", "to be decided", "maybe", "possibly", "not sure", "unsure",
-    "some", "several", "various", "etc", "approximately", "around",
-    "flexible", "as needed", "if possible", "might", "could be", "roughly"
-]
-
-REQ_DATE_PATTERN = DATE_PATTERN
-CURRENCY_PATTERN = re.compile(r'[\$₹€£]\s?\d[\d,]*(?:\.\d+)?')
 
 
 def extract_text_generic(uploaded_file):
@@ -377,7 +449,7 @@ def find_ambiguous_sentences(sentences):
 
 def find_contradictions(full_text):
     conflicts = []
-    dates = list(dict.fromkeys(REQ_DATE_PATTERN.findall(full_text)))
+    dates = list(dict.fromkeys(DATE_PATTERN.findall(full_text)))
     if len(dates) > 1:
         conflicts.append(f"Multiple different dates were mentioned ({', '.join(dates[:6])}). Please confirm which one applies.")
     amounts = list(dict.fromkeys(CURRENCY_PATTERN.findall(full_text)))
@@ -513,20 +585,19 @@ with tab_summary:
             with st.spinner("Processing legal nodes and graph centrality..."):
                 summary = run_hi_legal_sum(input_text, k_val, w_sem, w_pos, w_tfidf, lambda_p)
 
-            # 1) HiLegalSum Output (existing algorithm output — unchanged)
+            # 1) HiLegalSum Output -- existing extractive summarization algorithm, unchanged
             st.success("Summary Generated!")
             st.markdown("### 🔷 HiLegalSum Output")
             for sent in summary:
                 st.markdown(f"**•** {sent}")
 
-            # 2) Original / Summary statistics (existing — unchanged)
+            # 2) Original / Summary statistics -- existing, unchanged
             st.divider()
             col1, col2 = st.columns(2)
             col1.metric("Original Sentences", len(simple_sent_tokenize(input_text)))
             col2.metric("Summary Sentences", len(summary))
 
-            # 3) Legal Suggestions — NEW, generated from the ORIGINAL input_text,
-            #    always shown after the summary/stats, never a feedback prompt.
+            # 3) Legal Suggestions -- analysis of the ORIGINAL input_text, always after the summary/stats
             st.divider()
             render_legal_suggestions(input_text)
 
