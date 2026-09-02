@@ -141,3 +141,44 @@ if st.button("Generate Legal Summary", type="primary"):
             col1, col2 = st.columns(2)
             col1.metric("Original Sentences", len(simple_sent_tokenize(input_text)))
             col2.metric("Summary Sentences", len(summary))
+
+# ============================================
+# 4. SUGGESTIONS / FEEDBACK SECTION
+# ============================================
+st.divider()
+st.markdown("### 💬 Suggestions / Feedback")
+st.caption("We'd love to hear your thoughts on the generated summary to help us improve HiLegalSum.")
+
+with st.form("feedback_form", clear_on_submit=True):
+    rating = st.radio(
+        "How useful was the generated summary?",
+        options=["👍 Very Useful", "🙂 Useful", "😐 Needs Improvement", "👎 Not Useful"],
+        index=None,
+        horizontal=True,
+    )
+
+    improvement_options = st.multiselect(
+        "What could be improved?",
+        options=[
+            "Relevance of selected sentences",
+            "Coverage of important legal information",
+            "Less redundancy",
+            "More concise summary",
+            "Better legal context",
+            "Other",
+        ],
+    )
+
+    additional_suggestions = st.text_area(
+        "Additional suggestions",
+        placeholder="Tell us what you liked or what could be improved...",
+        height=120,
+    )
+
+    submitted = st.form_submit_button("Submit Feedback", type="primary")
+
+    if submitted:
+        if rating or improvement_options or additional_suggestions.strip():
+            st.success("Thank you for your feedback! Your suggestions will help improve HiLegalSum.")
+        else:
+            st.warning("Please provide some feedback before submitting.")
