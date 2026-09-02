@@ -124,13 +124,47 @@ def _first_group(match):
     return None
 
 
+def _co_occurs(text, pattern_a, pattern_b, max_distance=400):
+    """Return (match_a, match_b) if a pattern_a hit and a pattern_b hit occur
+    within max_distance characters of each other anywhere in the text, else
+    (None, None). Used for relationship-based rules where the two concepts
+    may fall in different (but nearby) sentences rather than the same one."""
+    a_matches = list(re.finditer(pattern_a, text, re.IGNORECASE))
+    if not a_matches:
+        return None, None
+    b_matches = list(re.finditer(pattern_b, text, re.IGNORECASE))
+    if not b_matches:
+        return None, None
+    best = None
+    for am in a_matches:
+        for bm in b_matches:
+            if am.start() == bm.start() and am.end() == bm.end():
+                continue
+            dist = abs(am.start() - bm.start())
+            if dist <= max_distance and (best is None or dist < best[0]):
+                best = (dist, am, bm)
+    if best is None:
+        return None, None
+    return best[1], best[2]
+
+
 def analyze_legal_context(full_text):
     """
-    Fact-anchored analysis of the ORIGINAL legal context. A suggestion is
-    only produced when a keyword AND a concrete supporting fact are both
-    found near each other in the text -- bare keyword presence alone never
-    produces a suggestion. Returns dict: category -> list of insight strings
-    (2-4 each, capped, de-duplicated), each naming the specific fact found.
+    Analysis of the ORIGINAL legal context, built from relationships between
+    facts actually present in the text -- not from a single keyword firing
+    on its own. Two families of rules are used:
+
+    1) Anchor rules: a legal keyword paired with a concrete anchor found in
+       the same sentence-ish window (a day count, a date, a currency
+       amount, a percentage, a named clause/law/forum, a specific ground).
+    2) Relationship rules: two distinct concepts that co-occur nearby in the
+       document (e.g. "defect" + "specification", "withheld" + "dispute",
+       "appeal" + "judgment") are combined into one practical, paraphrased
+       suggestion that connects the two -- never a copied sentence, and
+       never fired from a single generic word appearing in isolation.
+
+    Returns dict: category -> list of insight strings (2-4 each, capped,
+    de-duplicated), each tied to a fact pattern actually found in the text.
     """
     low = full_text.lower()
     dates = list(dict.fromkeys(DATE_PATTERN.findall(full_text)))
@@ -191,6 +225,20 @@ def analyze_legal_context(full_text):
             f"Confidentiality obligations run for {dur} — confirm this duration and whether it survives after the agreement ends, since disclosure after that window may fall outside protection."
         )
 
+    # Appellate rights: an appeal tied to a judgment/order/ruling, even with
+    # no explicit deadline stated, still raises a practical "act before the
+    # window closes" consideration.
+    appeal_am, appeal_bm = _co_occurs(
+        full_text,
+        r'\bappeal\w*\b',
+        r'\b(judg?ment|order|ruling|decision|decree)s?\b',
+        max_distance=300
+    )
+    if appeal_am:
+        categories["Important Legal Issues"].append(
+            "Confirm the deadline and permissible grounds for exercising appellate rights against the judgment/order, since that window is typically time-limited and can close quickly."
+        )
+
     # ---------- Key Obligations ----------
     # Only include a modal-verb obligation when it has an identifiable, non-trivial action attached.
     obligation_hits = []
@@ -232,6 +280,18 @@ def analyze_legal_context(full_text):
         scope = indem_m.group(1)
         categories["Key Obligations"].append(
             f"An indemnification obligation specifically covers {scope} — identify which party bears this obligation and confirm the scope matches what actually occurred."
+        )
+
+    # Final/last payment or installment conditioned on inspection/acceptance.
+    finalpay_am, finalpay_bm = _co_occurs(
+        full_text,
+        r'\b(?:final|last|remaining)\s+(?:payment|instal{1,2}ment)\w*\b',
+        r'\b(inspection|inspected|acceptance|accepted)\b',
+        max_distance=300
+    )
+    if finalpay_am:
+        categories["Key Obligations"].append(
+            "Confirm whether the final payment condition tied to inspection and acceptance was actually satisfied before that installment was released or withheld."
         )
 
     # ---------- Potential Risks ----------
@@ -282,6 +342,53 @@ def analyze_legal_context(full_text):
             f"Termination is permitted '{ground}' — confirm the specific conditions for this ground were actually met, since invoking it without meeting them can itself be treated as a breach."
         )
 
+    # Defective/nonconforming goods vs. contractual specifications, delivery, or storage --
+    # a relationship rule (no date/amount/clause number required).
+    defect_am, defect_bm = _co_occurs(
+        full_text,
+        r'\b(defect\w*|nonconform\w*|faulty|malfunction\w*)\b',
+        r'\b(specification\w*|contract(?:ual)?\s+(?:terms|standards)|deliver\w*|storage|handling)\b',
+        max_distance=350
+    )
+    if defect_am:
+        mentions_storage = bool(re.search(r'\bstorage\b|\bhandling\b', full_text, re.IGNORECASE))
+        if mentions_storage:
+            risk_specifics.append("defects vs. delivery/storage")
+            categories["Potential Risks"].append(
+                "Review delivery, inspection, and storage records to establish whether the defects existed at the time of delivery or resulted from improper storage or handling afterward, since conformity with the contractual specifications is disputed."
+            )
+        else:
+            risk_specifics.append("defects vs. contractual specifications")
+            categories["Potential Risks"].append(
+                "Review inspection records taken at delivery to establish whether the goods actually conformed to the contractual specifications, since that conformity is disputed."
+            )
+
+    # Withholding payment because of a dispute or alleged defect.
+    withhold_am, withhold_bm = _co_occurs(
+        full_text,
+        r'\bwithh(?:old|eld|olding)\w*\b',
+        r'\b(defect\w*|dispute\w*|breach\w*|nonconform\w*)\b',
+        max_distance=300
+    )
+    if withhold_am:
+        risk_specifics.append("payment withheld over disputed defects")
+        categories["Potential Risks"].append(
+            "Confirm the contractual basis for withholding the remaining payment over the disputed defects, since withholding it without that basis could itself be treated as a breach."
+        )
+
+    # Responsibility for a defect/failure that is explicitly disputed between the parties.
+    resp_am, resp_bm = _co_occurs(
+        full_text,
+        r'\bdispute\w*\b',
+        r'\bresponsib\w*\b',
+        max_distance=250
+    )
+    if resp_am:
+        risk_specifics.append("responsibility for defects disputed")
+        categories["Potential Risks"].append(
+            "Clarify which party actually bears responsibility for the defects, since that responsibility appears to be disputed rather than settled by the contract's terms."
+        )
+
     # ---------- Important Deadlines / Clauses ----------
     notice_m = re.search(
         r'(\d{1,3})\s*-?\s*(?:day|days)\b' + _WIN + r'\bterminat\w*\b'
@@ -292,7 +399,7 @@ def analyze_legal_context(full_text):
     if notice_days:
         deadline_specifics.append(f"{notice_days}-day notice-before-termination")
         categories["Important Deadlines / Clauses"].append(
-            f"Termination requires a {notice_days}-day notice period first — verify that notice was actually given and that this exact window elapsed before termination was carried out."
+            f"Verify whether the {notice_days}-day notice period was consistent with the contractual termination requirements before termination was carried out."
         )
 
     payment_m = re.search(
@@ -305,6 +412,18 @@ def analyze_legal_context(full_text):
         deadline_specifics.append(f"{payment_days}-day payment window")
         categories["Important Deadlines / Clauses"].append(
             f"Payment is due within {payment_days} days — confirm whether payment was made inside that exact window, since this specific clause (not a general delay) is what triggers late-payment consequences."
+        )
+
+    # Multiple payment installments, even without a day-count, are worth flagging
+    # so each installment's own trigger condition gets checked individually.
+    installment_hits = re.findall(r'\b(first|second|third|fourth|final|last)\s+instal{1,2}ment\b', full_text, re.IGNORECASE)
+    if not installment_hits:
+        installment_hits = re.findall(r'\b(first|second|third|fourth|final|last)\s+payment\b', full_text, re.IGNORECASE)
+    unique_installments = list(dict.fromkeys([h.lower() for h in installment_hits]))
+    if len(unique_installments) >= 2 and not payment_days:
+        deadline_specifics.append(f"installments — {', '.join(unique_installments[:4])}")
+        categories["Important Deadlines / Clauses"].append(
+            f"The document splits payment into multiple installments ({', '.join(unique_installments[:4])}) — confirm the trigger condition for each installment individually, since they may not all depend on the same event."
         )
 
     renew_m = re.search(
@@ -347,11 +466,28 @@ def analyze_legal_context(full_text):
         )
 
     # ---------- Recommended Considerations (built from what was actually found) ----------
-    ambiguity_hits = [m for m in AMBIGUITY_MARKERS if re.search(rf'\b{re.escape(m)}\b', low)]
+    ambiguity_hits = [mk for mk in AMBIGUITY_MARKERS if re.search(rf'\b{re.escape(mk)}\b', low)]
     if ambiguity_hits:
         categories["Recommended Considerations"].append(
             f"The document uses the undefined term '{ambiguity_hits[0]}' rather than a fixed standard — seek written clarification of what this specifically requires, since it's open to differing interpretation."
         )
+
+    # Documentary evidence tied to a court/tribunal limiting or establishing losses.
+    evid_am, evid_bm = _co_occurs(
+        full_text,
+        r'\b(documentary evidence|records|receipts|invoices)\b',
+        r'\b(loss\w*|expense\w*|damages?)\b',
+        max_distance=300
+    )
+    court_mentions_loss = bool(re.search(r'\b(court|tribunal)\b', full_text, re.IGNORECASE)) and bool(
+        re.search(r'\b(established|verified|proven|substantiated|limited)\b' + _WIN + r'\b(loss\w*|expense\w*|damages?)\b', full_text, re.IGNORECASE)
+        or re.search(r'\b(loss\w*|expense\w*|damages?)\b' + _WIN + r'\b(established|verified|proven|substantiated)\b', full_text, re.IGNORECASE)
+    )
+    if evid_am or court_mentions_loss:
+        categories["Recommended Considerations"].append(
+            "Preserve documentary evidence supporting the claimed expenses or losses, since recovery appears to be limited to amounts that can actually be established through such evidence."
+        )
+
     if deadline_specifics:
         categories["Recommended Considerations"].append(
             f"Calendar the specific deadlines identified in this document ({'; '.join(deadline_specifics[:3])}), since each is tied to a distinct consequence if missed."
@@ -388,7 +524,7 @@ def render_legal_suggestions(full_text):
     if not any(categories.values()):
         st.write(
             "No suggestions with sufficient specific grounding (dates, amounts, "
-            "named clauses, defined terms, etc.) were found in the provided text."
+            "named clauses, defined terms, disputed facts, etc.) were found in the provided text."
         )
     else:
         for cat_name, items in categories.items():
